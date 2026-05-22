@@ -111,9 +111,13 @@ function fmtDuration(sec) {
 
 // ── Collectors ────────────────────────────────────────────────────────────────
 async function getValidatorProc() {
-  // ps: pid, %cpu, %mem, etime(seconds), rss(kb), comm — match the validator binary
+  // ps: pid, %cpu, %mem, etime(seconds), rss(kb), comm — match the validator binary.
+  // NOTE: Linux truncates the process "comm" name to 15 chars, so e.g.
+  // "tachyon-validator" appears as "tachyon-validat". We match on the first 15
+  // chars of the configured name so detection works regardless of truncation.
   const out = await sh('ps', ['-eo', 'pid,pcpu,pmem,etimes,rss,comm', '--sort=-pcpu']);
-  const line = out.split('\n').find((l) => l.includes(CFG.procName));
+  const needle = CFG.procName.slice(0, 15);
+  const line = out.split('\n').find((l) => l.includes(needle));
   if (!line) return { up: false };
   const p = line.trim().split(/\s+/);
   return {
