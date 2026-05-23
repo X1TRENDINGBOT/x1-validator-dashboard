@@ -236,19 +236,204 @@ async function getRecentLog() {
   return pick.map((l) => (l.length > 160 ? l.slice(0, 160) + '…' : l));
 }
 
+// Swap usage from /proc/meminfo (Linux). Best-effort; returns null on failure.
+// Swap usage from /proc/meminfo (Linux). Best-effort; returns null on failure.
+function getSwap() {
+  try {
+    const mi = fs.readFileSync('/proc/meminfo', 'utf8');
+    const tot = mi.match(/SwapTotal:\s+(\d+)\s*kB/);
+    const free = mi.match(/SwapFree:\s+(\d+)\s*kB/);
+    if (!tot) return null;
+    const totalKb = parseInt(tot[1], 10);
+    const freeKb = free ? parseInt(free[1], 10) : 0;
+    if (!totalKb) return { totalKb: 0, usedKb: 0, pct: 0 };
+    const usedKb = totalKb - freeKb;
+    return { totalKb, usedKb, pct: Math.round((usedKb / totalKb) * 100) };
+  } catch {
+    return null;
+  }
+}
+
+// ── Rate collectors (disk I/O, net throughput) ────────────────────────────────
+// /proc/diskstats and /proc/net/dev expose CUMULATIVE counters (since boot).
+// To show a RATE (bytes/sec) we remember the previous sample + timestamp and
+// diff against the current one. First call after start returns null (need two
+// samples to compute a rate). State is kept in module-level vars.
+let _prevDisk = null;   // { t, sectorsRead, sectorsWritten }
+let _prevNet  = null;   // { t, rx, tx }
+
+// Find the default-route network interface (works without hardcoding eth0/enpX).
+function detectNetIface() {
+  try {
+    const route = fs.readFileSync('/proc/net/route', 'utf8').split('\n');
+    for (const line of route.slice(1)) {
+      const f = line.trim().split(/\s+/);
+      // Destination 00000000 = default route; field[0] is the iface name.
+      if (f.length >= 2 && f[1] === '00000000') return f[0];
+    }
+  } catch { /* fall through */ }
+  return null;
+}
+
+// Sum disk I/O across all physical block devices (nvme*, sd*). On RAID0 the
+// md device itself often reports 0, so we sum the underlying physical drives.
+// /proc/diskstats fields: ... [3]=name [6]=sectorsRead [10]=sectorsWritten.
+// A sector is 512 bytes.
+function getDiskIO() {
+  try {
+    const lines = fs.readFileSync('/proc/diskstats', 'utf8').split('\n');
+    let sectorsRead = 0, sectorsWritten = 0;
+    for (const l of lines) {
+      const f = l.trim().split(/\s+/);
+      if (f.length < 11) continue;
+      const name = f[2];
+      // physical disks only — skip partitions (nvme0n1p1) and md/loop/dm
+      if (!/^(nvme\d+n\d+|sd[a-z]+|vd[a-z]+)$/.test(name)) continue;
+      sectorsRead    += parseInt(f[5], 10) || 0;
+      sectorsWritten += parseInt(f[9], 10) || 0;
+    }
+    const now = Date.now();
+    const cur = { t: now, sectorsRead, sectorsWritten };
+    let readBps = null, writeBps = null;
+    if (_prevDisk) {
+      const dt = (now - _prevDisk.t) / 1000;
+      if (dt > 0) {
+        readBps  = Math.max(0, (sectorsRead    - _prevDisk.sectorsRead)    * 512 / dt);
+        writeBps = Math.max(0, (sectorsWritten - _prevDisk.sectorsWritten) * 512 / dt);
+      }
+    }
+    _prevDisk = cur;
+    return { readBps, writeBps };
+  } catch {
+    return { readBps: null, writeBps: null };
+  }
+}
+
+// Net throughput on the default-route interface. /proc/net/dev fields per iface:
+// rx bytes is col[0] after the colon, tx bytes is col[8].
+function getNetIO() {
+  try {
+    const iface = detectNetIface();
+    if (!iface) return { iface: null, rxBps: null, txBps: null };
+    const lines = fs.readFileSync('/proc/net/dev', 'utf8').split('\n');
+    const row = lines.find((l) => l.trim().startsWith(iface + ':'));
+    if (!row) return { iface, rxBps: null, txBps: null };
+    const nums = row.split(':')[1].trim().split(/\s+/).map((n) => parseInt(n, 10));
+    const rx = nums[0], tx = nums[8];
+    const now = Date.now();
+    let rxBps = null, txBps = null;
+    if (_prevNet && _prevNet.iface === iface) {
+      const dt = (now - _prevNet.t) / 1000;
+      if (dt > 0) {
+        rxBps = Math.max(0, (rx - _prevNet.rx) / dt);
+        txBps = Math.max(0, (tx - _prevNet.tx) / dt);
+      }
+    }
+    _prevNet = { t: now, iface, rx, tx };
+    return { iface, rxBps, txBps };
+  } catch {
+    return { iface: null, rxBps: null, txBps: null };
+  }
+}
+
+// Best-effort validator metrics via the LOCAL RPC the dashboard already uses.
+// Everything here is wrapped so a slow/unsupported RPC never breaks the page —
+// each field falls back to null and the UI just hides it.
+//   - identity: this node's identity pubkey (getIdentity)
+//   - skipRate: leader-slot skip % for THIS validator from getBlockProduction
+//   - epoch:    current epoch + how far through it we are (getEpochInfo)
+//   - nextLeaderSlot: next slot this identity is scheduled to lead (getLeaderSchedule)
+async function getValidatorMetrics() {
+  const out = {
+    identity: null, skipRate: null, leaderSlots: null, skipped: null,
+    epoch: null, epochPct: null, nextLeaderSlot: null, slotsUntilLeader: null,
+    voteCredits: null, commission: null, activatedStake: null,
+  };
+  try {
+    const identityRes = await rpc('getIdentity');
+    const identity = identityRes && identityRes.identity ? identityRes.identity : null;
+    out.identity = identity;
+
+    const [epochInfo, blockProd, voteAccts] = await Promise.all([
+      rpc('getEpochInfo'),
+      rpc('getBlockProduction'),
+      rpc('getVoteAccounts'),
+    ]);
+
+    if (epochInfo && typeof epochInfo.slotIndex === 'number' && epochInfo.slotsInEpoch) {
+      out.epoch = epochInfo.epoch;
+      out.epochPct = Math.round((epochInfo.slotIndex / epochInfo.slotsInEpoch) * 100);
+    }
+
+    // getBlockProduction → byIdentity: { pubkey: [leaderSlots, blocksProduced] }
+    if (blockProd && blockProd.value && blockProd.value.byIdentity && identity) {
+      const mine = blockProd.value.byIdentity[identity];
+      if (Array.isArray(mine) && mine.length >= 2) {
+        const [leader, produced] = mine;
+        out.leaderSlots = leader;
+        out.skipped = leader - produced;
+        out.skipRate = leader > 0 ? +(((leader - produced) / leader) * 100).toFixed(2) : 0;
+      }
+    }
+
+    // getVoteAccounts → find our vote account by nodePubkey === identity.
+    // Gives commission, activated stake, and the latest epoch's vote credits.
+    if (voteAccts && identity) {
+      const all = [...(voteAccts.current || []), ...(voteAccts.delinquent || [])];
+      const mine = all.find((va) => va.nodePubkey === identity);
+      if (mine) {
+        out.commission = typeof mine.commission === 'number' ? mine.commission : null;
+        out.activatedStake = typeof mine.activatedStake === 'number'
+          ? Math.round(mine.activatedStake / 1e9) : null; // lamports → XNT
+        // epochCredits: [[epoch, credits, prevCredits], ...] — newest last.
+        // Per-epoch credits earned = credits - prevCredits for the latest entry.
+        if (Array.isArray(mine.epochCredits) && mine.epochCredits.length) {
+          const latest = mine.epochCredits[mine.epochCredits.length - 1];
+          if (Array.isArray(latest) && latest.length >= 3) {
+            out.voteCredits = latest[1] - latest[2];
+          }
+        }
+      }
+    }
+
+    // Next leader slot from the leader schedule (relative slots → absolute).
+    if (identity && epochInfo) {
+      const sched = await rpc('getLeaderSchedule', [null, { identity }]);
+      if (sched && sched[identity] && Array.isArray(sched[identity]) && sched[identity].length) {
+        const epochStart = epochInfo.absoluteSlot - epochInfo.slotIndex;
+        const upcoming = sched[identity]
+          .map((rel) => epochStart + rel)
+          .filter((abs) => abs >= epochInfo.absoluteSlot)
+          .sort((a, b) => a - b);
+        if (upcoming.length) {
+          out.nextLeaderSlot = upcoming[0];
+          out.slotsUntilLeader = upcoming[0] - epochInfo.absoluteSlot;
+        }
+      }
+    }
+  } catch {
+    /* leave nulls — UI hides missing fields */
+  }
+  return out;
+}
+
 async function collectAll() {
-  const [proc, sync, netSlot, diskLedger, conns, nft] = await Promise.all([
+  const [proc, sync, netSlot, diskLedger, conns, nft, valMetrics] = await Promise.all([
     getValidatorProc(),
     getSync(),
     getNetSlot(),
     getDisk(CFG.ledger),
     getConns(),
     getNftCounters(),
+    getValidatorMetrics(),
   ]);
   // accounts disk: try df on its mount (instant); if same fs as root that's fine.
   const diskAccounts = await getDisk(CFG.accounts);
   const trend = getRpcTrend();
   const recentLog = await getRecentLog();
+  const swap = getSwap();
+  const diskIO = getDiskIO();
+  const netIO = getNetIO();
 
   const lag = (sync.slot != null && typeof netSlot === 'number') ? (netSlot - sync.slot) : null;
 
@@ -260,14 +445,18 @@ async function collectAll() {
     lag,
     netSlot: typeof netSlot === 'number' ? netSlot : null,
     mem: { totalKb: Math.round(os.totalmem() / 1024), usedKb: Math.round((os.totalmem() - os.freemem()) / 1024) },
+    swap,
     loadavg: os.loadavg().map((n) => n.toFixed(2)),
     cores: os.cpus().length,
     diskLedger,
     diskAccounts,
+    diskIO,
+    netIO,
     conns,
     nft,
     trend,
     recentLog,
+    val: valMetrics,
   };
 }
 
@@ -368,113 +557,252 @@ ${err ? `<div class="err">${err}</div>` : ''}
 function pageShell() {
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>x1-validator</title><style>
-:root{--bg:#0C1410;--panel:#101c16;--line:#1f2b25;--dim:#5F5E5A;--mut:#888780;--fg:#D3D1C7;--grn:#5DCAA5;--amb:#EF9F27;--red:#F09595;--blu:#85B7EB}
+:root{
+  --bg:#070b09;--bg2:#0a0f0c;--panel:#0d1410;--panel2:#101813;--line:#1a2620;--line2:#243029;
+  --dim:#4a5650;--mut:#7d8a82;--fg:#cfd8d2;--fgb:#eef5f0;
+  --grn:#4fd1a1;--grn2:#2fa67d;--amb:#f0b429;--red:#f4736b;--blu:#6fa8e0;--vio:#a98fe8;
+  --glow:0 0 24px rgba(79,209,161,.10);
+}
 *{box-sizing:border-box}
-body{background:var(--bg);color:var(--fg);font-family:ui-monospace,Menlo,Consolas,monospace;margin:0;padding:18px;font-size:13px;line-height:1.5}
-.wrap{max-width:840px;margin:0 auto}
-.hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
-.hdr .l{color:var(--grn);font-size:14px;font-weight:500}
-.hdr .r{color:var(--dim);font-size:12px}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 18px;margin-bottom:12px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 32px}
-.row{display:flex;justify-content:space-between;line-height:2}
-.row .k{color:var(--mut)}
-.sec{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px}
-.bar{height:6px;background:#1f2b25;border-radius:3px;margin:5px 0 12px;overflow:hidden}
-.bar>div{height:100%}
-.grn{color:var(--grn)}.amb{color:var(--amb)}.red{color:var(--red)}.blu{color:var(--blu)}.dim{color:var(--dim)}
-.log div{line-height:1.8;white-space:pre;overflow:hidden;text-overflow:ellipsis}
-.spark{display:flex;align-items:flex-end;gap:2px;height:36px;margin-top:6px}
-.spark>div{flex:1;background:#185FA5;border-radius:1px;min-height:2px}
-.stale{opacity:.5}
-@media(max-width:600px){.grid{grid-template-columns:1fr}}
+html,body{margin:0}
+body{
+  background:
+    radial-gradient(900px 500px at 85% -8%, rgba(79,209,161,.06), transparent 60%),
+    radial-gradient(700px 420px at 5% 110%, rgba(111,168,224,.05), transparent 55%),
+    var(--bg);
+  color:var(--fg);
+  font-family:'Berkeley Mono',ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+  padding:22px 18px 40px;font-size:13px;line-height:1.45;
+  -webkit-font-smoothing:antialiased;letter-spacing:.01em;
+}
+.wrap{max-width:980px;margin:0 auto}
+
+/* header */
+.hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap;gap:8px}
+.hdr .l{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:600;color:var(--fgb);letter-spacing:.02em}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--grn);box-shadow:0 0 0 0 rgba(79,209,161,.6);animation:pulse 2.4s infinite}
+.dot.down{background:var(--red);animation:none}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(79,209,161,.5)}70%{box-shadow:0 0 0 7px rgba(79,209,161,0)}100%{box-shadow:0 0 0 0 rgba(79,209,161,0)}}
+.hdr .r{color:var(--dim);font-size:11.5px;letter-spacing:.03em}
+.hdr .r b{color:var(--mut);font-weight:500}
+
+/* layout */
+.cols{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:12px}
+.panel{
+  background:linear-gradient(180deg,var(--panel2),var(--panel));
+  border:1px solid var(--line);border-radius:14px;padding:16px 18px;
+  position:relative;overflow:hidden;
+}
+.panel::before{content:"";position:absolute;inset:0 0 auto 0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,.06),transparent)}
+.span2{grid-column:span 2}
+.span3{grid-column:span 3}
+.sec{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.16em;margin-bottom:12px;font-weight:600}
+
+/* gauges */
+.gauges{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px}
+.gauges.g4{grid-template-columns:1fr 1fr 1fr 1fr}
+.rates{display:flex;gap:18px;margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.rate{display:flex;flex-direction:column;gap:3px}
+.rate .rk{font-size:9.5px;text-transform:uppercase;letter-spacing:.12em;color:var(--dim);font-weight:600}
+.rate .rv{font-size:12.5px;color:var(--fg);font-variant-numeric:tabular-nums}
+.gauge{display:flex;flex-direction:column;align-items:center;gap:6px}
+.gwrap{position:relative;width:88px;height:88px}
+.gwrap svg{transform:rotate(-90deg)}
+.gtrack{fill:none;stroke:var(--line2);stroke-width:8}
+.garc{fill:none;stroke-width:8;stroke-linecap:round;transition:stroke-dashoffset .8s cubic-bezier(.2,.7,.2,1),stroke .4s}
+.gcenter{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.gval{font-size:20px;font-weight:700;color:var(--fgb);letter-spacing:-.02em;line-height:1}
+.gunit{font-size:10px;color:var(--mut);margin-top:1px}
+.glabel{font-size:9.5px;text-transform:uppercase;letter-spacing:.12em;color:var(--mut);font-weight:600}
+.gsub{font-size:10px;color:var(--dim);text-align:center}
+
+/* stat list */
+.kv{display:flex;justify-content:space-between;align-items:baseline;padding:7px 0;border-bottom:1px solid rgba(26,38,32,.5)}
+.kv:last-child{border-bottom:0}
+.kv .k{color:var(--mut);font-size:12px}
+.kv .v{color:var(--fg);font-size:12.5px;text-align:right;font-variant-numeric:tabular-nums}
+.big{font-size:15px;font-weight:600;color:var(--fgb)}
+
+/* pills + bars */
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:999px;font-size:11px;font-weight:600;letter-spacing:.02em}
+.pill::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor;opacity:.9}
+.pill.grn{color:var(--grn);background:rgba(79,209,161,.10)}
+.pill.amb{color:var(--amb);background:rgba(240,180,41,.10)}
+.pill.red{color:var(--red);background:rgba(244,115,107,.10)}
+.pill.blu{color:var(--blu);background:rgba(111,168,224,.10)}
+.pill.dim{color:var(--mut);background:rgba(125,138,130,.08)}
+.bar{height:7px;background:var(--line2);border-radius:6px;overflow:hidden;margin:7px 0 2px}
+.bar>div{height:100%;border-radius:6px;transition:width .8s cubic-bezier(.2,.7,.2,1)}
+.barrow{display:flex;justify-content:space-between;align-items:baseline;margin-top:12px}
+.barrow:first-child{margin-top:0}
+.barrow .k{color:var(--mut);font-size:12px}
+.barrow .v{font-size:12px;font-variant-numeric:tabular-nums}
+
+.grn{color:var(--grn)}.amb{color:var(--amb)}.red{color:var(--red)}.blu{color:var(--blu)}.vio{color:var(--vio)}.dim{color:var(--dim)}.mut{color:var(--mut)}
+
+/* sparkline */
+.spark{display:flex;align-items:flex-end;gap:2px;height:48px;margin-top:4px}
+.spark>div{flex:1;background:linear-gradient(180deg,var(--blu),rgba(111,168,224,.25));border-radius:2px 2px 0 0;min-height:2px;transition:height .6s}
+.sparkmeta{display:flex;justify-content:space-between;margin-top:10px}
+
+/* log */
+.log{display:flex;flex-direction:column;gap:3px;margin-top:2px}
+.log div{line-height:1.7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11.5px;padding-left:12px;position:relative}
+.log div::before{content:"";position:absolute;left:0;top:8px;width:4px;height:4px;border-radius:50%;background:currentColor;opacity:.6}
+.staleflag{opacity:.45;transition:opacity .3s}
+@media(max-width:820px){.cols{grid-template-columns:1fr 1fr}.span2,.span3{grid-column:span 2}.gauges,.gauges.g4{grid-template-columns:1fr 1fr}}
+@media(max-width:560px){.cols{grid-template-columns:1fr}.span2,.span3{grid-column:span 1}}
 </style></head><body>
 <div class="wrap" id="root">
-  <div class="hdr"><span class="l">● x1-validator</span><span class="r">connecting…</span></div>
+  <div class="hdr"><span class="l"><span class="dot"></span>x1-validator</span><span class="r">connecting…</span></div>
   <div class="panel">loading…</div>
 </div>
 <script>
 const REFRESH=${CFG.refreshSec};
-function cls(v,warn,bad){ if(v>=bad)return 'red'; if(v>=warn)return 'amb'; return 'grn'; }
-function esc(s){ return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
-function gb(kb){ if(kb==null)return '—'; const g=kb/1048576; return g>=1024?(g/1024).toFixed(1)+'T':g.toFixed(1)+'G'; }
-function dur(s){ if(s==null)return '—'; const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60); return d>0?d+'d '+h+'h':h>0?h+'h '+m+'m':m+'m'; }
-function logColor(l){ if(/ERROR|panic|failed/i.test(l))return 'red'; if(/WARN|warn/i.test(l))return 'amb'; return 'dim'; }
+function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function gb(kb){if(kb==null)return '—';const g=kb/1048576;return g>=1024?(g/1024).toFixed(1)+'T':g.toFixed(1)+'G';}
+function rate(bps){if(bps==null)return '—';if(bps>=1048576)return (bps/1048576).toFixed(1)+' MB/s';if(bps>=1024)return (bps/1024).toFixed(0)+' KB/s';return Math.round(bps)+' B/s';}
+function dur(s){if(s==null)return '—';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d>0?d+'d '+h+'h':h>0?h+'h '+m+'m':m+'m';}
+function pickCls(v,warn,bad){if(v==null)return 'dim';if(v>=bad)return 'red';if(v>=warn)return 'amb';return 'grn';}
+function col(c){return {grn:'#4fd1a1',amb:'#f0b429',red:'#f4736b',blu:'#6fa8e0',vio:'#a98fe8',dim:'#4a5650'}[c]||'#4fd1a1';}
+function logColor(l){if(/ERROR|panic|failed/i.test(l))return 'red';if(/WARN|warn/i.test(l))return 'amb';return 'dim';}
+
+// arc gauge — value 0..100, returns an SVG ring + center label
+function gauge(label,pct,centerVal,centerUnit,sub,c){
+  const R=37,C=2*Math.PI*R;
+  const p=Math.max(0,Math.min(100,pct==null?0:pct));
+  const off=C*(1-p/100);
+  const stroke=col(c);
+  return '<div class="gauge">'
+    +'<div class="gwrap"><svg width="88" height="88" viewBox="0 0 88 88">'
+    +'<circle class="gtrack" cx="44" cy="44" r="'+R+'"></circle>'
+    +'<circle class="garc" cx="44" cy="44" r="'+R+'" stroke="'+stroke+'" '
+    +'stroke-dasharray="'+C.toFixed(1)+'" stroke-dashoffset="'+off.toFixed(1)+'"></circle>'
+    +'</svg><div class="gcenter"><div class="gval">'+centerVal+'</div>'
+    +(centerUnit?'<div class="gunit">'+centerUnit+'</div>':'')+'</div></div>'
+    +'<div class="glabel">'+label+'</div>'
+    +(sub?'<div class="gsub">'+sub+'</div>':'')
+    +'</div>';
+}
+function kv(k,v,big){return '<div class="kv"><span class="k">'+k+'</span><span class="v'+(big?' big':'')+'">'+v+'</span></div>';}
+function pill(txt,c){return '<span class="pill '+c+'">'+txt+'</span>';}
+function bar(name,used,total,pct,c){
+  const cc=col(c);
+  return '<div class="barrow"><span class="k">'+name+'</span><span class="v '+c+'">'+gb(used)+' / '+gb(total)+' · '+pct+'%</span></div>'
+    +'<div class="bar"><div style="width:'+Math.max(2,Math.min(100,pct))+'%;background:linear-gradient(90deg,'+cc+'88,'+cc+')"></div></div>';
+}
 
 async function tick(){
   let d;
   try{ d=await (await fetch('/data',{cache:'no-store'})).json(); }
-  catch(e){ document.querySelector('.hdr .r').textContent='fetch error — retrying'; return; }
+  catch(e){
+    const r=document.querySelector('.hdr .r'); if(r)r.textContent='fetch error — retrying';
+    const root=document.getElementById('root'); if(root)root.classList.add('staleflag');
+    return;
+  }
+  document.getElementById('root').classList.remove('staleflag');
   render(d);
 }
 
 function render(d){
   const p=d.proc||{up:false};
-  const memPct=d.mem? Math.round(d.mem.usedKb/d.mem.totalKb*100):null;
-  const ledPct=d.diskLedger? d.diskLedger.pct:null;
-  const accPct=d.diskAccounts? d.diskAccounts.pct:null;
-  const cpuPerCore=p.up&&d.cores? (p.cpu/d.cores):null;
+  const cores=d.cores||1;
+  // CPU as % of total capacity: raw ps %cpu (e.g. 742) / cores (e.g. 32) ≈ 23%
+  const cpuPct = p.up ? Math.round(p.cpu/cores) : null;
+  const memPct = d.mem? Math.round(d.mem.usedKb/d.mem.totalKb*100):null;
+  const swap = d.swap||null;
+  const led=d.diskLedger, acc=d.diskAccounts;
+  const ledPct = led? led.pct : null;
+  const io = d.diskIO||{readBps:null,writeBps:null};
+  const net = d.netIO||{iface:null,rxBps:null,txBps:null};
+  const v=d.val||{};
   const lag=d.lag;
-  const statusTxt=p.up?'RUNNING':'DOWN';
-  const statusCls=p.up?'grn':'red';
+
+  const statusUp=p.up;
+  const statusCls=statusUp?'grn':'red';
   const healthCls=d.sync.health==='ok'?'grn':(d.sync.health==='unknown'?'amb':'red');
+  const load1=d.loadavg?parseFloat(d.loadavg[0]):null;
+  const loadPctOfCores=load1!=null?Math.round(load1/cores*100):null;
 
   const trend=d.trend||{};
   const deltas=trend.deltas||[];
   const maxD=Math.max(1,...deltas);
-  const spark=deltas.length? '<div class="spark">'+deltas.map(v=>'<div style="height:'+Math.max(2,Math.round(v/maxD*36))+'px"></div>').join('')+'</div>'
-    : '<div class="dim" style="margin-top:6px">no hourly samples yet (fills over first day)</div>';
+  const spark=deltas.length
+    ? '<div class="spark">'+deltas.map(x=>'<div style="height:'+Math.max(2,Math.round(x/maxD*48))+'px"></div>').join('')+'</div>'
+    : '<div class="dim" style="padding:14px 0">no hourly samples yet (fills over first day)</div>';
+  const rpcLoadTxt = trend.perHour!=null ? (Math.round(trend.perHour/60).toLocaleString()+'/min') : '—';
 
-  const rpcLoadTxt = trend.perHour!=null ? (Math.round(trend.perHour/60)+'/min last hr') : 'awaiting samples';
+  // skip-rate coloring: green <2%, amber 2-5%, red >5% (network avg ~1.5%)
+  const skipCls = v.skipRate==null?'dim':(v.skipRate>5?'red':v.skipRate>2?'amb':'grn');
 
   const root=document.getElementById('root');
   root.innerHTML = ''
-  +'<div class="hdr"><span class="l">● x1-validator '+esc(d.host)+'</span>'
-  +'<span class="r">refresh '+REFRESH+'s · '+esc(d.ts)+' UTC</span></div>'
+  // header
+  +'<div class="hdr"><span class="l"><span class="dot'+(statusUp?'':' down')+'"></span>x1-validator · '+esc(d.host)+'</span>'
+  +'<span class="r">'+pill(statusUp?'RUNNING':'DOWN',statusCls)+' &nbsp; <b>'+esc(d.ts)+' UTC</b> · refresh '+REFRESH+'s</span></div>'
 
-  +'<div class="panel"><div class="grid">'
-  +rowKV('status','<span class="'+statusCls+'">'+statusTxt+(p.up?' · '+dur(p.uptimeSec):'')+'</span>')
-  +rowKV('health','<span class="'+healthCls+'">'+esc(d.sync.health)+'</span>')
-  +rowKV('slot', d.sync.slot!=null? d.sync.slot.toLocaleString():'—')
-  +rowKV('net lag', lag!=null? (lag<=0?'<span class="grn">caught up</span>':'<span class="'+cls(lag,30,150)+'">'+lag+' slots</span>') : '<span class="dim">n/a</span>')
-  +rowKV('rpc load', '<span class="'+(trend.perHour>6000?'amb':'grn')+'">'+rpcLoadTxt+'</span>')
-  +rowKV('connections','rpc '+(d.conns?d.conns.rpc:'—')+' · ws '+(d.conns?d.conns.ws:'—'))
-  +rowKV('cpu', p.up? '<span class="'+cls(cpuPerCore,60,90)+'">'+Math.round(p.cpu)+'% · '+d.cores+'c</span>':'—')
-  +rowKV('ram', d.mem? '<span class="'+cls(memPct,75,90)+'">'+gb(d.mem.usedKb)+'/'+gb(d.mem.totalKb)+' · '+memPct+'%</span>':'—')
-  +'</div></div>'
-
-  +'<div class="panel">'
-  +'<div class="sec">disk</div>'
-  +diskBar('ledger', d.diskLedger)
-  +diskBar('accounts', d.diskAccounts)
+  // top row: gauges (span 2) + validator
+  +'<div class="cols">'
+  +'<div class="panel span2"><div class="sec">system load</div><div class="gauges g4">'
+  +gauge('cpu',cpuPct,(cpuPct==null?'—':cpuPct),'%',(p.up?Math.round(p.cpu)+'% · '+cores+'c':'down'),pickCls(cpuPct,60,85))
+  +gauge('memory',memPct,(memPct==null?'—':memPct),'%',(d.mem?gb(d.mem.usedKb)+'/'+gb(d.mem.totalKb):'—'),pickCls(memPct,75,90))
+  +gauge('load',loadPctOfCores,(load1==null?'—':load1.toFixed(1)),'1m',(d.loadavg?d.loadavg.join('/'):'—'),pickCls(loadPctOfCores,80,100))
+  +gauge('ledger',ledPct,(ledPct==null?'—':ledPct),'%',(led?gb(led.usedKb)+'/'+gb(led.totalKb):'—'),pickCls(ledPct,80,90))
+  +'</div>'
+  // I/O + net throughput rate readouts (rates aren't 0-100% so shown as numbers)
+  +'<div class="rates">'
+  +'<div class="rate"><span class="rk">disk</span><span class="rv">↓ '+rate(io.readBps)+' &nbsp; ↑ '+rate(io.writeBps)+'</span></div>'
+  +'<div class="rate"><span class="rk">net'+(net.iface?' ('+esc(net.iface)+')':'')+'</span><span class="rv">↓ '+rate(net.rxBps)+' &nbsp; ↑ '+rate(net.txBps)+'</span></div>'
+  +'</div>'
   +'</div>'
 
-  +'<div class="panel">'
-  +'<div class="sec">rpc packets · last '+(deltas.length||0)+'h</div>'
+  // validator panel
+  +'<div class="panel"><div class="sec">validator</div>'
+  +kv('status', '<span class="'+statusCls+'">'+(statusUp?'running':'down')+'</span>'+(statusUp?' · '+dur(p.uptimeSec):''))
+  +kv('health', '<span class="'+healthCls+'">'+esc(d.sync.health)+'</span>')
+  +kv('net lag', lag==null?'<span class="dim">n/a</span>':(lag<=0?'<span class="grn">caught up</span>':'<span class="'+pickCls(lag,30,150)+'">'+lag+' slots</span>'))
+  +kv('skip rate', v.skipRate==null?'<span class="dim">—</span>':'<span class="'+skipCls+'">'+v.skipRate+'%</span>'+(v.leaderSlots!=null?' <span class="dim">('+v.skipped+'/'+v.leaderSlots+')</span>':''))
+  +kv('vote credits', v.voteCredits==null?'<span class="dim">—</span>':'<span class="grn">'+v.voteCredits.toLocaleString()+'</span> <span class="dim">this epoch</span>')
+  +kv('commission', v.commission==null?'<span class="dim">—</span>':v.commission+'%')
+  +kv('next leader', v.slotsUntilLeader==null?'<span class="dim">—</span>':'in '+v.slotsUntilLeader.toLocaleString()+' slots')
+  +'</div>'
+  +'</div>' // end top cols
+
+  // second row: chain + storage + rpc
+  +'<div class="cols">'
+  +'<div class="panel"><div class="sec">chain</div>'
+  +kv('slot', d.sync.slot!=null?'<span class="big">'+d.sync.slot.toLocaleString()+'</span>':'—', true)
+  +kv('epoch', v.epoch!=null?(v.epoch+(v.epochPct!=null?' · '+v.epochPct+'%':'')):'<span class="dim">—</span>')
+  +(v.epochPct!=null?'<div class="bar"><div style="width:'+v.epochPct+'%;background:linear-gradient(90deg,#a98fe888,#a98fe8)"></div></div>':'')
+  +kv('stake', v.activatedStake!=null?v.activatedStake.toLocaleString()+' XNT':'<span class="dim">—</span>')
+  +kv('connections', 'rpc '+(d.conns?d.conns.rpc:'—')+' · ws '+(d.conns?d.conns.ws:'—'))
+  +'</div>'
+
+  // storage (accounts + swap as bars; ledger is now the 4th gauge above)
+  +'<div class="panel"><div class="sec">storage</div>'
+  +(acc?bar('accounts',acc.usedKb,acc.totalKb,acc.pct,pickCls(acc.pct,80,90)):'<div class="dim">accounts —</div>')
+  +(swap&&swap.totalKb>0?bar('swap',swap.usedKb,swap.totalKb,swap.pct,pickCls(swap.pct,40,75)):'<div class="barrow"><span class="k">swap</span><span class="v dim">'+(swap?'none':'—')+'</span></div>')
+  +'<div class="barrow"><span class="k">rpc load</span><span class="v '+(trend.perHour>6000?'amb':'grn')+'">'+rpcLoadTxt+'</span></div>'
+  +'</div>'
+
+  // rpc packets
+  +'<div class="panel"><div class="sec">rpc packets · last '+(deltas.length||0)+'h</div>'
   +spark
-  +'<div class="row" style="margin-top:8px"><span class="k">cumulative (8899)</span><span>'+(d.nft&&d.nft.rpc!=null? d.nft.rpc.toLocaleString():'—')+'</span></div>'
-  +'<div class="row"><span class="k">last 24h</span><span>'+(trend.last24!=null? trend.last24.toLocaleString()+' pkts':'—')+'</span></div>'
+  +'<div class="sparkmeta"><span class="mut" style="font-size:11px">cumulative</span><span class="v" style="font-size:12px">'+(d.nft&&d.nft.rpc!=null?d.nft.rpc.toLocaleString():'—')+'</span></div>'
+  +'<div class="sparkmeta"><span class="mut" style="font-size:11px">last 24h</span><span class="v" style="font-size:12px">'+(trend.last24!=null?trend.last24.toLocaleString()+' pkts':'—')+'</span></div>'
   +'</div>'
+  +'</div>' // end second cols
 
-  +'<div class="panel"><div class="sec">recent log</div><div class="log">'
-  +((d.recentLog&&d.recentLog.length)? d.recentLog.map(l=>'<div class="'+logColor(l)+'">'+esc(l)+'</div>').join('') : '<div class="dim">no recent warnings/errors</div>')
+  // log
+  +'<div class="panel span3"><div class="sec">recent log</div><div class="log">'
+  +((d.recentLog&&d.recentLog.length)?d.recentLog.map(l=>'<div class="'+logColor(l)+'">'+esc(l)+'</div>').join(''):'<div class="dim">no recent warnings/errors</div>')
   +'</div></div>';
-}
-
-function rowKV(k,v){ return '<div class="row"><span class="k">'+k+'</span><span>'+v+'</span></div>'; }
-function diskBar(name,disk){
-  if(!disk) return '<div class="row"><span class="k">'+name+'</span><span class="dim">—</span></div>';
-  const c = disk.pct>=90?'red':disk.pct>=80?'amb':'grn';
-  const col = disk.pct>=90?'#F09595':disk.pct>=80?'#EF9F27':'#5DCAA5';
-  return '<div class="row"><span class="k">'+name+'</span><span class="'+c+'">'+gb(disk.usedKb)+'/'+gb(disk.totalKb)+'  '+disk.pct+'%</span></div>'
-    +'<div class="bar"><div style="width:'+Math.min(100,disk.pct)+'%;background:'+col+'"></div></div>';
 }
 
 tick();
 setInterval(tick, REFRESH*1000);
 </script></body></html>`;
 }
-
 function printHelp() {
   console.log(`
 X1 Validator Dashboard — setup (SSH-tunnel mode, no open port, no password)
